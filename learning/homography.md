@@ -38,6 +38,36 @@ OpenCV solves for the 9 values of $H$ (8 degrees of freedom since it's scale-inv
 
 ---
 
+## Where the Real-World Coordinates Come From
+
+You don't measure the `dst` values — you look them up. A badminton court is a standardized object, so every regulation court has the same line positions in meters. The real-world coordinates are known by definition.
+
+### Recipe
+
+1. **Pick an origin.** Any consistent point works — commonly the back-left doubles corner, with X across the court (sideline-to-sideline) and Y down its length (baseline-to-baseline).
+2. **Look up BWF court dimensions.** Width 6.1 m (doubles), length 13.4 m, short service line 1.98 m from net, long service line 0.76 m from baseline, etc.
+3. **For each labeled keypoint, record its (X, Y) from your origin.**
+
+| Landmark | Real-world (m) |
+|----------|----------------|
+| Back-left doubles corner | (0, 0) |
+| Back-right doubles corner | (6.1, 0) |
+| Front-right doubles corner | (6.1, 13.4) |
+| Front-left doubles corner | (0, 13.4) |
+| Net × left sideline | (0, 6.7) |
+| Center × short service line (back) | (3.05, 4.72) |
+
+So `dst` is a hard-coded constant — the BWF spec baked into your code. Only `src` (the detected pixel positions) changes per video.
+
+### Keypoint identity matters
+
+The detector must tell *which* keypoint each detection is — "back-left corner" vs "back-right corner" — otherwise you can't pair pixel positions with the right real-world coordinates. Two approaches:
+
+- **Per-class keypoints:** one class per landmark (`kp_back_left`, `kp_back_right`, …). The detector itself disambiguates. Cleaner but more classes.
+- **Single class + spatial sorting:** one `court_keypoint` class, disambiguate by image position (top-leftmost detection = back-left corner, etc.). Fewer classes, fragile if camera angle varies.
+
+---
+
 ## At Inference Time
 
 Once you have $H$, any detected pixel position (shuttle, player) gets transformed instantly:
@@ -64,6 +94,10 @@ Regular 2D points are $(x, y)$. To do perspective transforms with matrix multipl
 
 After multiplying by $H$ you get $(wX, wY, w)$. Dividing by $w$ recovers the real 2D point. When $w=1$ it's simple; when $w \neq 1$ (which happens with perspective) the division is what "undoes" the distortion.
 
+**Important:** the 3-vector form is *not* a real 3D point. Both input $(x, y, 1)$ and output $(wX, wY, w)$ are 2D points wearing a "scale tag" — $(2, 3, 1)$, $(4, 6, 2)$, and $(10, 15, 5)$ all represent the same 2D point $(2, 3)$. Homography is a **plane → plane** mapping (court plane to image plane); there is no real 3D intermediate. The third coordinate is bookkeeping for the perspective divide, not a trip through 3D space.
+
+**Why the divide is what makes perspective work:** if $H$ were affine (rotation/scale/translation only), the bottom row would be $(0, 0, 1)$ and $w$ would always equal $1$ — no division needed. But for perspective, $w = h_{31}x + h_{32}y + h_{33}$ depends on the input pixel, so different pixels get divided by different amounts. That input-dependent division is precisely what produces non-linear effects (far baseline compressed, parallel lines converging). Linear matrix multiplication alone can't do that.
+
 ### 2. Matrix-Vector Multiplication
 
 $$H \begin{pmatrix} x \\ y \\ 1 \end{pmatrix}$$
@@ -79,6 +113,22 @@ That's where the numerator/denominator expressions come from.
 $H$ has 9 numbers but only 8 degrees of freedom. Homogeneous coordinates are scale-invariant — multiplying all of $H$ by any constant gives the same transformation (the $w$ in the denominator cancels it out). So one value is redundant; by convention $h_{33} = 1$, leaving 8 free parameters.
 
 Each point correspondence gives you 2 equations ($X$ and $Y$). So you need at least **4 points** to solve for 8 unknowns. OpenCV uses more than 4 (overdetermined system) and solves it with least squares — minimizing the total error across all correspondences.
+
+---
+
+## The Full Pipeline
+
+| Step | Tool | Frequency |
+|------|------|-----------|
+| Detect court keypoints | YOLOv8 (trained model) | Per frame, or once per video |
+| Compute $H$ | `cv2.findHomography(src, dst)` | Once per video |
+| Detect shuttle | YOLOv8 | Per frame |
+| Map shuttle to court coordinates | `cv2.perspectiveTransform` | Per frame |
+| Speed from positions + timestamps | Plain math | Per shot |
+
+YOLO finds things in pixel space. OpenCV does the geometry. The labeled training set teaches YOLO what court keypoints look like — without those labels, there's no way to find the `src` points needed to compute $H$.
+
+$H$ is computed **once per video**, not per frame, because the court doesn't move. A moving or zooming camera invalidates $H$ and forces continuous recomputation — which is why fixed-camera broadcast footage is essential.
 
 ### 4. Solving for H — SVD
 
