@@ -77,19 +77,26 @@ This is the most important phase of the entire project.
 
 ---
 
-### Step 4 — Augment and export dataset
+### Step 4 — Preprocess and export dataset
 **Time: 1 hour | Difficulty: Easy**
 
-In Roboflow, apply augmentations before exporting:
-- Brightness: ±25%
-- Blur: up to 1.5px (simulates fast shuttlecock motion)
-- Horizontal flip (only for player and court_keypoint — disable for shuttlecock if
-  it has asymmetric shape)
+In Roboflow, generate a dataset version with:
 
-Export in **YOLOv8 format**. Roboflow will give you a download link or a pip install
-command that pulls the dataset directly into your training script.
+**Preprocessing** (applied to all images):
+- Auto-Orient: ON (fixes EXIF rotation issues)
+- Resize: Stretch to 640×640 (YOLOv8's default training input size)
 
-Split: 80% train / 10% validation / 10% test. Roboflow does this automatically.
+**Augmentation:** skip in Roboflow. YOLOv8 applies its own augmentation pipeline
+at training time — HSV jitter, scale, translation, horizontal flip, and mosaic
+(which stitches 4 images together to dramatically help small-object detection
+like shuttlecock). Static Roboflow augmentation on top of this is redundant and
+can drift augmented-of-augmented images too far from realistic data.
+
+**Split:** 70% train / 20% validation / 10% test. The validation set is
+non-optional — YOLOv8 uses it for early stopping and overfitting detection.
+
+Export in **YOLOv8 format**. Roboflow gives you a download link or a Python
+snippet (with API key) that pulls the dataset directly into your training script.
 
 ---
 
@@ -98,40 +105,122 @@ Split: 80% train / 10% validation / 10% test. Roboflow does this automatically.
 
 ---
 
+### Approach: single pose model vs two-model split
+
+The Roboflow project exports as **YOLOv8 Pose** format with multi-class support
+(`nc=3`, `kpt_shape=[22, 3]`). This unlocks two viable training approaches:
+
+**Approach A — Single YOLOv8 Pose model (currently trying):**
+One `yolov8m-pose.pt` model handles all three classes simultaneously:
+- `badminton_court` — bbox + 22 visible keypoints
+- `Player` — bbox only (keypoint slots stored as zeros, visibility=0)
+- `Birdie` — bbox only (keypoint slots stored as zeros, visibility=0)
+
+Keypoint loss is automatically masked when visibility=0, so `Player`/`Birdie`
+train as standard object detection. One model, one training run, one inference
+pass per frame.
+
+**Approach B — Two separate models (fallback):**
+- Model 1: YOLOv8 Detect for `Player` + `Birdie` (2 classes, no keypoints)
+- Model 2: YOLOv8 Pose for `badminton_court` only (1 class, 22 keypoints)
+
+Requires a small Python script to split the YOLOv8-pose export into two
+datasets. Slightly more inference cost, though the court model only needs to
+run once per video since the camera is fixed.
+
+Use Approach A unless training is unstable. Signs to fall back to B:
+- Loss diverges or produces NaNs partway through training
+- `pose_loss` is 10×+ the `box_loss` / `cls_loss` terms in the per-epoch log
+- `badminton_court` mAP is fine but `Player` / `Birdie` mAP is much lower than
+  expected for those simple classes
+- Validation images saved under `runs/pose/train/` show garbage keypoint
+  predictions even on training data
+- Multi-class pose proves fragile in this Ultralytics version
+
+**Fallback procedure (if Approach A fails):**
+
+1. **Split the dataset locally.** Write a small Python script that walks the
+   YOLOv8-pose `labels/*.txt` files and produces two parallel datasets:
+   - `dataset_detect/` — keep only rows for class 0 (`Birdie`) and class 1
+     (`Player`). Strip the 66 keypoint columns from each row, leaving only
+     `class_id cx cy w h`.
+   - `dataset_pose/` — keep only rows for class 2 (`badminton_court`). Remap
+     the class_id from 2 → 0 (single-class pose). Keep all keypoint columns.
+
+   Copy the corresponding images alongside each label set. Reuse the same
+   train/valid/test split assignments from the original export.
+
+2. **Write two `data.yaml` files**, one per dataset:
+   - Detect yaml: `nc: 2`, `names: ['Birdie', 'Player']`, no `kpt_shape`
+   - Pose yaml: `nc: 1`, `names: ['badminton_court']`, `kpt_shape: [22, 3]`,
+     `flip_idx: [0, 1, 2, ..., 21]`
+
+3. **Train both models:**
+   - Detect: `yolo train model=yolov8m.pt data=dataset_detect/data.yaml ...` →
+     produces `players.pt`
+   - Pose: `yolo train model=yolov8m-pose.pt data=dataset_pose/data.yaml ...` →
+     produces `court.pt`
+
+4. **Update inference glue.** Load both checkpoints at startup. Run `court.pt`
+   **once per video** on frame 1 to extract 22 keypoint pixel positions and
+   compute the homography matrix. Run `players.pt` **on every frame** for
+   `Player` and `Birdie` detection. Transform detections to court coordinates
+   using the precomputed homography.
+
+The split script is ~30 lines of Python; the inference glue adds ~20 lines on
+top of the single-model path. The downstream homography math, shot detection,
+and visualization (Phases 3–5) are unchanged.
+
+---
+
 ### Step 5 — Set up training environment
 **Time: 2 hours | Difficulty: Easy–Medium**
 
+**Hardware:** local training on NVIDIA RTX 5070 Ti Laptop GPU (Blackwell, 12GB
+VRAM). Sufficient for YOLOv8m-pose at 640×640 with batch=16. No cloud GPU
+needed for the MVP — keeps the iteration loop tight.
+
 Install dependencies:
 ```
-pip install ultralytics roboflow torch torchvision
+pip install ultralytics torch torchvision opencv-python
 ```
 
-Verify CUDA is available (GPU training is 10–50x faster than CPU):
+The 5070 Ti is a Blackwell-generation GPU, so install a **recent** PyTorch
+build with CUDA 12.4+ support. From the PyTorch website, pick the latest
+stable wheel for CUDA 12.4 or higher.
+
+Verify CUDA is available and the GPU is recognized:
 ```python
 import torch
-print(torch.cuda.is_available())  # must print True
+print(torch.cuda.is_available())           # must print True
+print(torch.cuda.get_device_name(0))       # should print "NVIDIA GeForce RTX 5070 Ti Laptop GPU"
 ```
 
-If False, you need to install the CUDA-compatible version of PyTorch. Check the
-PyTorch website for the correct install command for your GPU and CUDA version.
+If `cuda.is_available()` is False or the device name is wrong, reinstall
+PyTorch with the correct CUDA build before continuing.
 
 ---
 
 ### Step 6 — Train YOLOv8 on your dataset
-**Time: 3 hours active + overnight compute | Difficulty: Medium**
+**Time: 3 hours active + 1–3 hours compute | Difficulty: Medium**
 
-Start with `yolov8m` (medium size — good balance of speed and accuracy). Training
-on a modern GPU takes 4–8 hours for 100 epochs on ~1000 images. Start it before
-bed and check results in the morning.
+Start from a **pose** checkpoint (Approach A):
+- `yolov8s-pose.pt` for a fast baseline (~45 min on 5070 Ti)
+- `yolov8m-pose.pt` for the final run (~1.5–3 hours on 5070 Ti)
 
-The training script specifies: which model to start from, where your dataset is,
-how many epochs, image size, and batch size. YOLOv8 saves the best-performing
-checkpoint automatically.
+If falling back to Approach B, start from `yolov8s.pt` / `yolov8m.pt` (detect)
+for the player/birdie model, and `yolov8s-pose.pt` / `yolov8m-pose.pt` for the
+court model.
+
+The training script specifies: which model to start from, where your dataset
+is, how many epochs, image size, and batch size. YOLOv8 saves the
+best-performing checkpoint automatically under `runs/pose/train*/weights/`.
 
 Key parameters:
 - `epochs=100` — number of full passes through the dataset
 - `imgsz=640` — image size (larger = slower but better for small objects like shuttlecock)
 - `batch=16` — images processed simultaneously (reduce if GPU runs out of memory)
+- `device=0` — use the first CUDA GPU
 
 ---
 

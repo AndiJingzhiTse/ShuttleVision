@@ -1,0 +1,16 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+kpt_shape: [22, 3]
+flip_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+
+nc: 3
+names: ['Birdie', 'Player', 'badminton_court']
+
+roboflow:
+  workspace: tennis-analysis-9zsyi
+  project: badmintoncourtdetectionoffical-b3hl9-pq4ug
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/tennis-analysis-9zsyi/badmintoncourtdetectionoffical-b3hl9-pq4ug/dataset/1
